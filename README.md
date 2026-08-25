@@ -51,6 +51,7 @@ External detector observations -----+          |
 - `LC02` Pose、`DEP1` 分片 Depth 和双头 8×8 `TOF1`。
 - OpenCV DNN ONNX 足球检测或内置圆形/黑白比例 heuristic。
 - `BusinessObservations` 外部检测结果覆盖，用于接入使用者自己的 detector。
+- `IBusinessInstance`、`ISensorProvider` 与 `RuntimeHost` 组合，用于在不复制 runner 的情况下接入自有业务。
 
 输出是完整 `RobotControlCommand`，保留 mode、gait、velocity、RPY、body height、step height、duration 和 heartbeat `life_count`。
 
@@ -86,6 +87,22 @@ ctest --test-dir build --output-on-failure
 ```
 
 Tests 使用合成图像、loopback UDP 和 Pose 动力学仿真，不连接真实设备。覆盖 phase catalog、遮挡球 mask 恢复、六阶段主流程、Stage4 fallback、fail-closed、完整 command relay、Depth 分片、ToF、image/audio codec 和 replay。
+
+自定义业务 Runtime 另有原子测试覆盖 provider lifecycle、not-ready、end-of-stream、异常、输出失败、严格 tick budget、heartbeat 回绕、stop request 和 stop-on-exit。`doogle_custom_business_example` 是不依赖设备的完整接入示例。
+
+## 自定义业务接口
+
+新业务只需实现两个输入侧契约，并复用一个输出侧契约：
+
+- `doogle::instance::IBusinessInstance`：接收原子 `SensorFrame`，返回 `BusinessDecision`。
+- `doogle::instance::ISensorProvider`：负责 sensor lifecycle，并返回 ready、not-ready、end-of-stream 或 error。
+- `doogle::ports::MotionSink`：发布完整 `RobotControlCommand`。
+
+`doogle::runtime::RuntimeHost` 负责组合三者，统一处理 reset、tick budget、heartbeat、fail-closed、stop request、异常边界和退出 stop。已有 Stage1–6 可通过 `StageBusinessInstance` 适配到同一接口，新业务无需依赖具体 `BusinessEngine`。
+
+需要直接复用本项目 file/ZMQ/UDP/ONNX 输入时，可使用 `StandardSensorProvider`；只有接入其他 middleware 时才需要自行实现 `ISensorProvider`。
+
+完整代码见 `instance/example/custom_business.cpp` 和 [INTEGRATION.md](INTEGRATION.md)。
 
 ## 运行
 

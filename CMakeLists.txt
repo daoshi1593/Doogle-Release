@@ -4,6 +4,7 @@ project(doogle LANGUAGES CXX)
 set(DOOGLE_PROJECT_DISPLAY_NAME "Doogle比赛代码")
 set(DOOGLE_PROJECT_DESCRIPTION "Doogle project")
 set(DOOGLE_IMPLEMENTATION_LANGUAGE "Native C++")
+option(DOOGLE_BUILD_EXAMPLES "Build Doogle integration examples" ON)
 
 include(CTest)
 find_package(OpenCV 4.5 REQUIRED COMPONENTS core imgproc imgcodecs dnn)
@@ -72,6 +73,7 @@ add_library(doogle_instance_runtime STATIC
     instance/runtime/depth_assembler.cpp
     instance/runtime/heartbeat.cpp
     instance/runtime/motion_relay.cpp
+    instance/runtime/standard_sensor_provider.cpp
     instance/runtime/udp_command_receiver.cpp
     instance/runtime/udp_sensor_hub.cpp
     instance/runtime/zmq_frame_receiver.cpp
@@ -79,12 +81,32 @@ add_library(doogle_instance_runtime STATIC
 target_include_directories(doogle_instance_runtime PRIVATE ${ZMQ_INCLUDE_DIRS})
 target_link_libraries(doogle_instance_runtime
     PUBLIC doogle_service_domain doogle_service_control doogle_service_protocol
-    PRIVATE ${ZMQ_LIBRARIES}
+    PRIVATE doogle_service_perception ${ZMQ_LIBRARIES}
+)
+
+add_library(doogle_instance_host STATIC
+    instance/runtime/runtime_host.cpp
+)
+target_include_directories(doogle_instance_host PUBLIC ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(doogle_instance_host
+    PUBLIC doogle_service_domain ${OpenCV_LIBS}
+)
+
+add_library(doogle_instance_stage_adapter STATIC
+    instance/api/stage_business_instance.cpp
+)
+target_link_libraries(doogle_instance_stage_adapter
+    PUBLIC doogle_instance_host doogle_instance_competition_core
+)
+
+add_library(doogle_instance_infra INTERFACE)
+target_link_libraries(doogle_instance_infra INTERFACE
+    doogle_instance_host doogle_instance_runtime doogle_service_adapter
 )
 
 add_library(doogle_instance STATIC instance/competition/stage_app.cpp)
 target_link_libraries(doogle_instance
-    PUBLIC doogle_instance_competition_core doogle_instance_runtime doogle_service_adapter
+    PUBLIC doogle_instance_competition_core doogle_instance_infra
 )
 
 # External entry points are all owned by Instance.
@@ -101,6 +123,11 @@ foreach(stage RANGE 1 6)
     add_executable(doogle_stage${stage} instance/app/doogle_stage${stage}.cpp)
     target_link_libraries(doogle_stage${stage} PRIVATE doogle_instance)
 endforeach()
+
+if(DOOGLE_BUILD_EXAMPLES)
+    add_executable(doogle_custom_business_example instance/example/custom_business.cpp)
+    target_link_libraries(doogle_custom_business_example PRIVATE doogle_instance_host)
+endif()
 
 if(BUILD_TESTING)
     add_executable(doogle_unit_tests instance/test/core_tests.cpp)
@@ -124,4 +151,14 @@ if(BUILD_TESTING)
         doogle_service_protocol
     )
     add_test(NAME doogle_transport_tests COMMAND doogle_transport_tests)
+
+    add_executable(doogle_runtime_host_tests instance/test/runtime_host_tests.cpp)
+    target_link_libraries(doogle_runtime_host_tests PRIVATE
+        doogle_instance_infra doogle_instance_stage_adapter
+    )
+    add_test(NAME doogle_runtime_host_tests COMMAND doogle_runtime_host_tests)
+
+    if(DOOGLE_BUILD_EXAMPLES)
+        add_test(NAME doogle_custom_business_example_smoke COMMAND doogle_custom_business_example)
+    endif()
 endif()

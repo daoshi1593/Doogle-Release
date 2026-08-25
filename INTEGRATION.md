@@ -9,7 +9,9 @@
 | 运行 Stage1–6 | `doogle::stage6::run_stage` | `doogle_instance` |
 | 将自己的传感器数据输入现有业务 | `doogle::competition::BusinessEngine` | `doogle_instance_competition_core` |
 | 使用自己的 detector | `SensorFrame::observations` / `SensorFrame::football` | `doogle_instance_competition_core` |
-| 编写自己的业务 Instance | `service/perception`、`service/control`、`service/protocol` | 对应 `doogle_service_*` |
+| 编写自己的业务 Instance | `IBusinessInstance` + `RuntimeHost` | `doogle_instance_infra` |
+| 仅使用抽象 Host 与自有 I/O | `RuntimeHost` | `doogle_instance_host` |
+| 将现有 Stage1–6 放入 Host | `StageBusinessInstance` | `doogle_instance_stage_adapter` |
 | 新增 transport | Service codec + Instance runtime owner | `doogle_instance_runtime` |
 | 新增运动输出 | 实现 `doogle::ports::MotionSink` | `doogle_service_domain` |
 
@@ -19,8 +21,10 @@
 add_subdirectory(path/to/Doogle)
 
 add_executable(my_business main.cpp)
-target_link_libraries(my_business PRIVATE doogle_instance)
+target_link_libraries(my_business PRIVATE doogle_instance_infra)
 ```
+
+如果只运行仓库内置 Stage1–6，则链接 `doogle_instance`；如果 sensor 与 motion 都由使用者提供，只链接更轻量的 `doogle_instance_host`。
 
 只复用算法与协议：
 
@@ -130,39 +134,128 @@ Override 缺失时，BusinessEngine 自动调用 native C++ perception。Overrid
 
 ## 5. 编写自己的业务 Instance
 
-业务状态必须放在 `instance/`；Service 只提供无状态算法。External 应只构造并调用一个 Instance：
+业务状态必须放在 `instance/`；Service 只提供无状态算法。实现 `IBusinessInstance` 后，业务只需关心一个原子输入和一个确定输出：
 
 ```cpp
+#include "instance/api/business_instance.hpp"
 #include "service/perception/vision.hpp"
-#include "service/protocol/robot_control_cmd.hpp"
 
-class MyBusinessInstance {
+class MyBusinessInstance final : public doogle::instance::IBusinessInstance {
 public:
-    doogle::protocol::RobotControlCommand tick(const cv::Mat& frame) {
+    std::string_view name() const noexcept override { return "my_business"; }
+
+    doogle::competition::BusinessDecision tick(
+        const doogle::competition::SensorFrame& frame
+    ) override {
+        doogle::competition::BusinessDecision decision;
+        decision.command.contact = 15;
         const auto target = doogle::perception::detect_colored_target(
-            frame,
+            frame.rgb,
             doogle::perception::VisualTarget::BlueBall
         );
-        doogle::protocol::RobotControlCommand command;
-        command.contact = 15;
         if (!target.component.detected) {
-            command.mode = 12;
-            return command;
+            decision.command.mode = 12;
+            decision.fail_closed = true;
+            decision.reason = "blue_ball_not_ready";
+            return decision;
         }
-        command.mode = 11;
-        command.gait_id = 27;
+        decision.command.mode = 11;
+        decision.command.gait_id = 27;
         const double error = target.component.center_x_ratio - 0.5;
-        command.vel_des = {
+        decision.command.vel_des = {
             0.08F,
             static_cast<float>(std::clamp(-0.35 * error, -0.08, 0.08)),
             0.0F,
         };
-        return command;
+        decision.action = "follow_blue_ball";
+        decision.reason = "visual_target_ready";
+        return decision;
+    }
+
+    void reset() override {}
+};
+```
+
+接口定义与具体 Stage engine 分离：只实现新业务时包含 `business_instance.hpp`；需要将现有 Stage1–6 放入通用 Runtime 时，使用 `stage_business_instance.hpp` 中的 `StageBusinessInstance`。
+
+## 6. 使用 RuntimeHost 组合业务
+
+复用现有 file、ZMQ、UDP 和 ONNX 输入链路时，直接配置 `StandardSensorProvider`：
+
+```cpp
+#include "instance/runtime/standard_sensor_provider.hpp"
+
+doogle::runtime::StandardSensorProviderConfig sensor_config;
+sensor_config.rgb_endpoint = rgb_endpoint;
+sensor_config.left_fisheye_endpoint = left_endpoint;
+sensor_config.right_fisheye_endpoint = right_endpoint;
+sensor_config.pose_port = pose_port;
+sensor_config.depth_port = depth_port;
+sensor_config.tof_port = tof_port;
+sensor_config.football_model_path = model_path;
+
+doogle::runtime::StandardSensorProvider sensors{std::move(sensor_config)};
+```
+
+它负责 image file、ZMQ receiver、UDP sensor hub、Depth 重组、Pose 角度转换和可选足球模型。尚未收到任何输入时返回 not-ready，由 `RuntimeHost` 强制 stop。纯定时、无传感器业务可显式设置 `allow_empty_frames=true`。
+
+接入其他 middleware 时实现 `ISensorProvider`：
+
+```cpp
+#include "instance/api/sensor_provider.hpp"
+
+class MySensorProvider final : public doogle::instance::ISensorProvider {
+public:
+    bool open() override { return transport_.open(); }
+    void close() noexcept override { transport_.close(); }
+
+    doogle::instance::SensorRead read(std::chrono::milliseconds timeout) override {
+        const auto sample = transport_.receive(timeout);
+        if (sample.error) return doogle::instance::SensorRead::error(sample.message);
+        if (sample.finished) return doogle::instance::SensorRead::end_of_stream();
+        if (!sample.ready) return doogle::instance::SensorRead::not_ready();
+
+        doogle::competition::SensorFrame frame;
+        frame.rgb = sample.rgb;
+        frame.pose = sample.pose;
+        frame.control_safe = sample.control_safe;
+        return doogle::instance::SensorRead::ready(std::move(frame));
     }
 };
 ```
 
-## 6. 接入新的 Sensor Provider
+然后将 business、provider 与 motion sink 注入 `RuntimeHost`：
+
+```cpp
+#include "instance/runtime/runtime_host.hpp"
+
+MyBusinessInstance business;
+MySensorProvider sensors;
+MyMotionSink motion;
+
+doogle::runtime::RuntimeHostConfig config;
+config.period = std::chrono::milliseconds{50};
+config.max_ticks = 4000;
+config.allow_incomplete = false;
+
+doogle::runtime::RuntimeHost host{business, sensors, motion, config};
+const auto report = host.run();
+return report.success ? 0 : 1;
+```
+
+`RuntimeHost` 保证：
+
+- 每次 run 按配置 reset business，并严格 open/close provider。
+- not-ready、unsafe frame 和 stop request 强制输出 stop，不信任业务误发的运动命令。
+- provider 给出的时间戳原样传入业务，便于 deterministic replay 和 simulation。
+- 每条发布命令统一维护 `life_count`。
+- complete、tick budget、end-of-stream、sensor/business/output error 都返回结构化 `RuntimeReport`。
+- 默认在任何退出路径补发 stop；可用 `stop_on_exit=false` 显式关闭。
+- `request_stop()` 可从 signal handler 外的控制线程调用。
+
+可以直接运行 `doogle_custom_business_example` 查看不依赖硬件的完整组合。其源码位于 `instance/example/custom_business.cpp`。
+
+## 7. 接入新的 Sensor Provider
 
 拆分为两层：
 
@@ -180,7 +273,7 @@ public:
 
 Provider 必须满足：不发布 partial frame；sequence 和 timestamp 可检查；Pose 有限且原子；Depth 收齐后才提交；错误或过期数据返回 not-ready，让业务 fail-closed。
 
-## 7. 接入 Motion Sink 与 Relay
+## 8. 接入 Motion Sink 与 Relay
 
 自有输出实现 `doogle::ports::MotionSink`：
 
@@ -197,7 +290,7 @@ public:
 
 长期运行建议把 command packet 发到 `doogle_relay`。Relay 的接收端写入 `CommandSlot`，heartbeat 只更新 `life_count`，不会丢失 RPY、body height、step height 或 duration；stale timeout 和进程退出都会发送 stop。
 
-## 8. Replay Contract
+## 9. Replay Contract
 
 每行 trace schema：
 
@@ -207,11 +300,13 @@ stage timestamp_ms pose_valid x y yaw "rgb" "ai" "left" "right" "depth" football
 
 未提供的 image path 写 `"-"`。同一 trace 可包含不同 Stage，replay 为每个 Stage 保留独立状态。
 
-## 9. 验收清单
+## 10. 验收清单
 
 - [ ] External 只调用 Instance。
 - [ ] 业务状态只存在于 Instance。
 - [ ] Service 无 socket、thread 和业务 phase。
+- [ ] 自定义业务通过 `IBusinessInstance` 接入，不复制 Runtime 主循环。
+- [ ] 自定义 sensor 通过 `ISensorProvider` 发布原子 `SensorFrame`。
 - [ ] Sensor snapshot 完整、原子、可判定新鲜度。
 - [ ] 缺少核心输入、unsafe control 和 stop request 均 fail-closed。
 - [ ] Motion endpoint 必须显式启用。
